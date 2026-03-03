@@ -113,17 +113,8 @@ async fn sensitive_to_balance_changes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Regression test: a transaction with maxFeePerGas below the chain's base fee
-/// must not hang the block executor indefinitely.
-///
-/// The bug: The VM rejects such a tx with `BaseFeeGreaterThanMaxFee`, which is
-/// classified as `Skip` (not `Purge`). The sender gets blacklisted in the
-/// BestTransactions iterator for the current block, but the tx stays in the pool.
-/// Since no tx succeeded, the block deadline is never armed, causing
-/// `tokio::select!` to hang — no deadline fires, and the stream returns Pending.
-///
-/// Expected behavior when fixed: The block executor should recover from the
-/// poisoning tx and subsequent legitimate transactions should still get mined.
+/// A transaction with maxFeePerGas below the chain's base fee must not stall
+/// block production for other senders.
 #[test_log::test(tokio::test)]
 async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
     // Use a deterministic base fee so the "low fee" value is unambiguous.
@@ -176,9 +167,8 @@ async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
         .expect_successful_receipt()
         .await?;
 
-    // Step 3: Submit poisoning tx from Alice with maxFeePerGas=7 (far below base fee of 100M).
+    // Step 3: Submit a low-fee tx from Alice with maxFeePerGas=7 (far below base fee of 100M).
     // Uses build() + send_raw_transaction() to bypass provider fee estimation.
-    // Reth pool accepts it because tx_fee_cap is set to 0 (fee checks disabled).
     let nonce = tester.l2_provider.get_transaction_count(alice).await?;
     let poison_tx = TransactionRequest::default()
         .with_to(Address::random())
@@ -195,11 +185,10 @@ async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
         .send_raw_transaction(&poison_encoded)
         .await?;
 
-    // Give the block executor time to pick up the poisoning tx
+    // Give the block executor time to pick up the low-fee tx
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Step 4: Send a legitimate follow-up from Bob (independent sender, no nonce dependency).
-    // If the bug is present, this tx will never get mined because the block executor is hung.
     let follow_up_tx = TransactionRequest::default()
         .with_from(bob)
         .with_to(Address::random())
@@ -217,18 +206,16 @@ async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
 
     match result {
         Ok(Ok(_receipt)) => {
-            // Block executor recovered from the poison tx — test passes
+            // Block executor handled the low-fee tx gracefully — test passes
         }
         Ok(Err(e)) => {
             panic!("Follow-up transaction failed unexpectedly: {e:#}");
         }
         Err(_elapsed) => {
             panic!(
-                "BUG: Follow-up transaction not mined within 30s. \
-                 The block executor is hung due to the low-fee poisoning tx \
-                 (maxFeePerGas=7, baseFee={known_base_fee}). \
-                 BaseFeeGreaterThanMaxFee is classified as Skip, the deadline \
-                 is never armed, and tokio::select! hangs forever."
+                "Follow-up transaction not mined within 30s. \
+                 The low-fee tx (maxFeePerGas=7, baseFee={known_base_fee}) \
+                 appears to have stalled block production for other senders."
             );
         }
     }
