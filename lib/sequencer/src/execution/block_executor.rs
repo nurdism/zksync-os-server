@@ -23,11 +23,21 @@ use zksync_os_types::{SystemTxType, ZkTransaction, ZkTxType, ZksyncOsEncode};
 // a side effect of this is that it's harder to pass config values (normally we'd just pass the whole config object)
 // please be mindful when adding new parameters here
 
+/// Outcome of block execution.
+pub enum ExecuteBlockOutcome {
+    /// Block was sealed with transactions.
+    Sealed(BlockOutput, ReplayRecord, Vec<(TxHash, InvalidTransaction)>),
+    /// No transactions were successfully executed (e.g. all L2 txs failed validation).
+    /// The caller should retry with a fresh BlockContext and transaction stream rather
+    /// than producing an empty block.
+    NoValidTransactions,
+}
+
 pub async fn execute_block<R: ReadStateHistory + WriteState>(
     mut command: PreparedBlockCommand<'_>,
     state: R,
     latency_tracker: &ComponentStateHandle<SequencerState>,
-) -> Result<(BlockOutput, ReplayRecord, Vec<(TxHash, InvalidTransaction)>), BlockDump> {
+) -> Result<ExecuteBlockOutcome, BlockDump> {
     tracing::debug!(command = ?command, block_number=command.block_context.block_number, "Executing command");
     latency_tracker.enter_state(SequencerState::InitializingVm);
     let ctx = command.block_context;
@@ -61,7 +71,7 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
         SealPolicy::Decide(d, _) => Some(d),
         SealPolicy::UntilExhausted { .. } => None,
     };
-    let mut deadline: Option<Pin<Box<Sleep>>> = None; // will arm after 1st tx success
+    let mut deadline: Option<Pin<Box<Sleep>>> = None; // will arm after 1st tx attempt
     let mut interop_roots_count = 0;
 
     /* ---------- main loop ------------------------------------------ */
@@ -111,6 +121,17 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
                 );
 
                 all_processed_txs.push(tx.clone());
+
+                // Arm the deadline on the first tx attempt (success or failure).
+                // This prevents indefinite hangs when all L2 txs fail validation
+                // (e.g. BaseFeeGreaterThanMaxFee) and no L1 txs arrive to break
+                // the deadlock. Without this, the block executor would wait forever
+                // because the deadline only armed on success, and the sender is
+                // marked invalid in the BestTransactions iterator after a failure.
+                if deadline.is_none() && let Some(dur) = deadline_dur {
+                    deadline = Some(Box::pin(tokio::time::sleep(dur)));
+                }
+
                 match runner.execute_next_tx(tx.clone().encode())
                     .await
                     .map_err(|e| {
@@ -141,11 +162,6 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
                         let tx_type = tx.tx_type();
                         executed_txs.push(tx);
                         cumulative_gas_used += res.gas_used;
-
-                        // arm the timer once, after the first successful tx
-                        if deadline.is_none() && let Some(dur) = deadline_dur {
-                            deadline = Some(Box::pin(tokio::time::sleep(dur)));
-                        }
                         if tx_type == ZkTxType::Upgrade {
                             match &command.seal_policy {
                                 SealPolicy::Decide(..) | SealPolicy::UntilExhausted { allowed_to_finish_early: true } => {
@@ -253,6 +269,17 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
     // seal reason validation
     match command.seal_policy {
         SealPolicy::Decide(_, _) => {
+            // If no transactions were successfully executed (e.g. all L2 txs had fees
+            // below base fee), skip block production entirely. The caller should retry
+            // with a fresh BlockContext and transaction stream.
+            if executed_txs.is_empty() {
+                tracing::info!(
+                    block_number = ctx.block_number,
+                    ?seal_reason,
+                    "no valid transactions executed → skipping block production"
+                );
+                return Ok(ExecuteBlockOutcome::NoValidTransactions);
+            }
             if seal_reason == SealReason::TxStreamExhausted {
                 return Err(BlockDump {
                     ctx,
@@ -353,7 +380,7 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
         });
     }
 
-    Ok((
+    Ok(ExecuteBlockOutcome::Sealed(
         output,
         ReplayRecord::new(
             ctx,
