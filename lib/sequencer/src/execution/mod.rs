@@ -114,8 +114,10 @@ where
             let (block_output, replay_record, purged_txs) = loop {
                 latency_tracker.enter_state(SequencerState::BlockContextTxs);
 
-                let prepared_command =
-                    self.block_context_provider.prepare_command(cmd.clone()).await?;
+                let prepared_command = self
+                    .block_context_provider
+                    .prepare_command(cmd.clone())
+                    .await?;
 
                 tracing::debug!(
                     block_number,
@@ -123,20 +125,17 @@ where
                     "Prepared command. Executing..",
                 );
 
-                let outcome =
-                    execute_block(prepared_command, self.state.clone(), &latency_tracker)
-                        .await
-                        .map_err(|dump| {
-                            let error = anyhow::anyhow!("{}", dump.error);
-                            tracing::info!("Saving dump..");
-                            if let Err(err) =
-                                save_dump(self.config.block_dump_path.clone(), dump)
-                            {
-                                tracing::error!(?err, "Failed to write block dump");
-                            }
-                            error
-                        })
-                        .context("execute_block")?;
+                let outcome = execute_block(prepared_command, self.state.clone(), &latency_tracker)
+                    .await
+                    .map_err(|dump| {
+                        let error = anyhow::anyhow!("{}", dump.error);
+                        tracing::info!("Saving dump..");
+                        if let Err(err) = save_dump(self.config.block_dump_path.clone(), dump) {
+                            tracing::error!(?err, "Failed to write block dump");
+                        }
+                        error
+                    })
+                    .context("execute_block")?;
 
                 match outcome {
                     ExecuteBlockOutcome::Sealed(output, record, purged) => {

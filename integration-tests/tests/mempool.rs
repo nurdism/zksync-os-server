@@ -151,10 +151,7 @@ async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
     // Step 2: Create Bob (independent sender) and fund him from Alice
     let bob_signer = PrivateKeySigner::random();
     let bob = bob_signer.address();
-    tester
-        .l2_provider
-        .wallet_mut()
-        .register_signer(bob_signer);
+    tester.l2_provider.wallet_mut().register_signer(bob_signer);
     tester
         .l2_provider
         .send_transaction(
