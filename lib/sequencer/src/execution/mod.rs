@@ -1,6 +1,6 @@
 use crate::config::SequencerConfig;
 use crate::execution::block_context_provider::BlockContextProvider;
-use crate::execution::block_executor::{ExecuteBlockOutcome, execute_block};
+use crate::execution::block_executor::execute_block;
 use crate::execution::metrics::{EXECUTION_METRICS, SequencerState};
 use crate::execution::utils::save_dump;
 use crate::model::blocks::BlockCommand;
@@ -106,26 +106,18 @@ where
                 cmd = cmd.to_string(),
                 "starting command. Turning into PreparedCommand.."
             );
+            latency_tracker.enter_state(SequencerState::BlockContextTxs);
 
-            // A single BlockCommand may require multiple BlockContext attempts when
-            // the only available transactions turn out to be invalid (e.g. fees below
-            // base fee). In that case execute_block returns NoValidTransactions and we
-            // retry with a fresh stream instead of producing an empty block.
-            let (block_output, replay_record, purged_txs) = loop {
-                latency_tracker.enter_state(SequencerState::BlockContextTxs);
+            let prepared_command = self.block_context_provider.prepare_command(cmd).await?;
 
-                let prepared_command = self
-                    .block_context_provider
-                    .prepare_command(cmd.clone())
-                    .await?;
+            tracing::debug!(
+                block_number,
+                starting_l1_priority_id = prepared_command.starting_l1_priority_id,
+                "Prepared command. Executing..",
+            );
 
-                tracing::debug!(
-                    block_number,
-                    starting_l1_priority_id = prepared_command.starting_l1_priority_id,
-                    "Prepared command. Executing..",
-                );
-
-                let outcome = execute_block(prepared_command, self.state.clone(), &latency_tracker)
+            let (block_output, replay_record, purged_txs) =
+                execute_block(prepared_command, self.state.clone(), &latency_tracker)
                     .await
                     .map_err(|dump| {
                         let error = anyhow::anyhow!("{}", dump.error);
@@ -136,20 +128,6 @@ where
                         error
                     })
                     .context("execute_block")?;
-
-                match outcome {
-                    ExecuteBlockOutcome::Sealed(output, record, purged) => {
-                        break (output, record, purged);
-                    }
-                    ExecuteBlockOutcome::NoValidTransactions => {
-                        tracing::info!(
-                            block_number,
-                            "no valid transactions in block context, retrying with fresh stream"
-                        );
-                        continue;
-                    }
-                }
-            };
 
             let time_since_last_block = last_processed_block_at
                 .map(|last_processed_block_at| last_processed_block_at.elapsed());

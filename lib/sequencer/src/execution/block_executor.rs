@@ -23,21 +23,11 @@ use zksync_os_types::{SystemTxType, ZkTransaction, ZkTxType, ZksyncOsEncode};
 // a side effect of this is that it's harder to pass config values (normally we'd just pass the whole config object)
 // please be mindful when adding new parameters here
 
-/// Outcome of block execution.
-pub enum ExecuteBlockOutcome {
-    /// Block was sealed with transactions.
-    Sealed(BlockOutput, ReplayRecord, Vec<(TxHash, InvalidTransaction)>),
-    /// No transactions were successfully executed (e.g. all L2 txs failed validation).
-    /// The caller should retry with a fresh BlockContext and transaction stream rather
-    /// than producing an empty block.
-    NoValidTransactions,
-}
-
 pub async fn execute_block<R: ReadStateHistory + WriteState>(
     mut command: PreparedBlockCommand<'_>,
     state: R,
     latency_tracker: &ComponentStateHandle<SequencerState>,
-) -> Result<ExecuteBlockOutcome, BlockDump> {
+) -> Result<(BlockOutput, ReplayRecord, Vec<(TxHash, InvalidTransaction)>), BlockDump> {
     tracing::debug!(command = ?command, block_number=command.block_context.block_number, "Executing command");
     latency_tracker.enter_state(SequencerState::InitializingVm);
     let ctx = command.block_context;
@@ -269,17 +259,6 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
     // seal reason validation
     match command.seal_policy {
         SealPolicy::Decide(_, _) => {
-            // If no transactions were successfully executed (e.g. all L2 txs had fees
-            // below base fee), skip block production entirely. The caller should retry
-            // with a fresh BlockContext and transaction stream.
-            if executed_txs.is_empty() {
-                tracing::info!(
-                    block_number = ctx.block_number,
-                    ?seal_reason,
-                    "no valid transactions executed → skipping block production"
-                );
-                return Ok(ExecuteBlockOutcome::NoValidTransactions);
-            }
             if seal_reason == SealReason::TxStreamExhausted {
                 return Err(BlockDump {
                     ctx,
@@ -380,7 +359,7 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
         });
     }
 
-    Ok(ExecuteBlockOutcome::Sealed(
+    Ok((
         output,
         ReplayRecord::new(
             ctx,
