@@ -1,5 +1,6 @@
 use crate::eth_impl::build_api_receipt;
 use crate::{ReadRpcStorage, RpcConfig};
+use alloy::consensus::Transaction;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::{B256, Bytes, U256};
@@ -57,6 +58,18 @@ impl<RpcStorage: ReadRpcStorage, Mempool: L2Subpool> TxHandler<RpcStorage, Mempo
         let l2_tx: L2Transaction = transaction
             .try_into_recovered()
             .map_err(|_| EthSendRawTransactionError::InvalidTransactionSignature)?;
+        // Validate tx fee against current basefee
+        let latest_block = self.storage.repository().get_latest_block();
+        if let Some(block_context) = self.storage.replay_storage().get_context(latest_block) {
+            let base_fee: u128 = block_context
+                .eip1559_basefee
+                .try_into()
+                .unwrap_or(u128::MAX);
+            if l2_tx.max_fee_per_gas() < base_fee {
+                return Err(EthSendRawTransactionError::MaxFeePerGasTooLow);
+            }
+        }
+
         let hash = *l2_tx.hash();
         if self.config.l2_signer_blacklist.contains(&l2_tx.signer()) {
             return Err(EthSendRawTransactionError::BlacklistedSigner);
@@ -154,6 +167,8 @@ pub enum EthSendRawTransactionError {
     ForwardError(#[from] RpcError<TransportErrorKind>),
     #[error("Signer is blacklisted")]
     BlacklistedSigner,
+    #[error("max fee per gas less than block base fee")]
+    MaxFeePerGasTooLow,
 }
 
 /// Error types returned by `eth_sendRawTransactionSync` implementation
