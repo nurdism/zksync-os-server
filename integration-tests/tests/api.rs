@@ -1,6 +1,6 @@
 use alloy::eips::Encodable2718;
 use alloy::network::{ReceiptResponse, TransactionBuilder, TxSigner};
-use alloy::primitives::{TxHash, U128, U256, address};
+use alloy::primitives::{Address, TxHash, U128, U256, address};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use regex::Regex;
@@ -230,6 +230,52 @@ async fn estimate_gas_with_high_prices() -> anyhow::Result<()> {
         .expect_successful_receipt()
         .await?;
     tracing::info!("Got receipt, gas used: {}", receipt.gas_used);
+
+    Ok(())
+}
+
+/// A transaction with maxFeePerGas below the chain's base fee should be rejected
+/// by the RPC with a clear error, not silently accepted into the mempool.
+#[test_log::test(tokio::test)]
+async fn send_raw_transaction_low_fee_rejected() -> anyhow::Result<()> {
+    let known_base_fee: u128 = 100_000_000; // 100M wei = 0.1 gwei
+    let fee_config = FeeConfig {
+        native_price_usd: 3e-9,
+        base_fee_override: Some(U128::from(known_base_fee)),
+        native_per_gas: 100,
+        pubdata_price_override: Some(U128::from(1_000_000u64)),
+        native_price_override: Some(U128::from(1_000_000u64)),
+        pubdata_price_cap: None,
+    };
+    let tester = Tester::builder().fee_config(fee_config).build().await?;
+
+    let chain_id = tester.l2_provider.get_chain_id().await?;
+    let alice = tester.l2_wallet.default_signer().address();
+    let nonce = tester.l2_provider.get_transaction_count(alice).await?;
+
+    // Build a tx with maxFeePerGas=7, far below the 100M base fee.
+    let low_fee_tx = TransactionRequest::default()
+        .with_to(Address::random())
+        .with_value(U256::from(1))
+        .with_nonce(nonce)
+        .with_gas_limit(21_000)
+        .with_max_fee_per_gas(7)
+        .with_max_priority_fee_per_gas(0)
+        .with_chain_id(chain_id);
+    let envelope = low_fee_tx.build(&tester.l2_wallet).await?;
+    let encoded = envelope.encoded_2718();
+
+    let error = tester
+        .l2_provider
+        .send_raw_transaction(&encoded)
+        .await
+        .expect_err("low-fee tx should be rejected by RPC");
+    assert!(
+        error
+            .to_string()
+            .contains("max fee per gas less than block base fee"),
+        "expected basefee error, got: {error}",
+    );
 
     Ok(())
 }
