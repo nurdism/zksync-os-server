@@ -118,6 +118,8 @@ pub async fn execute_block<R: ReadStateHistory + WriteState>(
                 // the deadlock. Without this, the block executor would wait forever
                 // because the deadline only armed on success, and the sender is
                 // marked invalid in the BestTransactions iterator after a failure.
+                // Note that this behavior may result in an empty block being mined,
+                // which is supported server behavour.
                 if deadline.is_none() && let Some(dur) = deadline_dur {
                     deadline = Some(Box::pin(tokio::time::sleep(dur)));
                 }
