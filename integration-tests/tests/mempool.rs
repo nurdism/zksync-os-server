@@ -177,7 +177,7 @@ async fn low_fee_tx_does_not_hang_block_executor() -> anyhow::Result<()> {
         .with_chain_id(chain_id);
     let poison_envelope = poison_tx.build(&tester.l2_wallet).await?;
     let poison_encoded = poison_envelope.encoded_2718();
-    tester
+    let _ = tester
         .l2_provider
         .send_raw_transaction(&poison_encoded)
         .await?;
